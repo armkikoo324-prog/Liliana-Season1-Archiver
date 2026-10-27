@@ -1,10 +1,14 @@
 import os
 import csv
-import json
-import re
+import time
 from datetime import datetime
-import requests
-from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
 
 URL = "https://tnstats.dev/season1/fyscchannels"
 FOLDER_NAME = "HistoryDataLilianaS1"
@@ -12,85 +16,79 @@ CSV_FILE_PATH = os.path.join(FOLDER_NAME, "liliana_season1_history.csv")
 
 os.makedirs(FOLDER_NAME, exist_ok=True)
 
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*"
-}
-
+# Set up CSV header if file doesn't exist
 if not os.path.exists(CSV_FILE_PATH):
     with open(CSV_FILE_PATH, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["timestamp", "datetime", "channel_id", "name", "subs", "avatar"])
 
+# Configure headless Chrome browser
+chrome_options = Options()
+chrome_options.add_argument("--headless")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
+rows_to_write = []
 now_ts = int(datetime.now().timestamp())
 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-rows_to_write = []
-
-# Try 1: Check direct API endpoint if available
-api_url = "https://tnstats.dev/api/season1/fyscchannels"
 try:
-    api_res = requests.get(api_url, headers=headers, timeout=10)
-    if api_res.status_code == 200:
-        data = api_res.json()
-        channels = data if isinstance(data, list) else data.get("channels", data.get("data", []))
-        for item in channels:
-            cid = item.get("id", item.get("channel_id", item.get("name", "")))
-            name = item.get("name", item.get("title", ""))
-            subs = item.get("subs", item.get("subscribers", item.get("count", 0)))
-            avatar = item.get("avatar", item.get("image", item.get("pfp", "")))
+    driver.get(URL)
+    # Wait up to 15 seconds for dynamic content to render
+    time.sleep(5)
+
+    # Find images or channel elements loaded by JS
+    images = driver.find_elements(By.TAG_NAME, "img")
+    
+    for img in images:
+        avatar = img.get_attribute("src") or ""
+        name = img.get_attribute("alt") or ""
+        
+        # Grab parent element text to extract subscriber count
+        try:
+            parent = img.find_element(By.XPATH, "..")
+            text = parent.text
+        except Exception:
+            text = ""
+
+        digits = ''.join(filter(str.isdigit, text))
+        subs = int(digits) if digits else 0
+
+        if name:
+            rows_to_write.append([now_ts, now_str, name, name, subs, avatar])
+
+    # Fallback to page source parsing if image tags weren't structured
+    if not rows_to_write:
+        items = driver.find_elements(By.XPATH, "//*[contains(@class, 'channel') or contains(@class, 'card') or contains(@class, 'item')]")
+        for item in items:
+            text = item.text
+            try:
+                img_el = item.find_element(By.TAG_NAME, "img")
+                avatar = img_el.get_attribute("src") or ""
+                name = img_el.get_attribute("alt") or item.text.split('\n')[0]
+            except Exception:
+                avatar = ""
+                name = ""
+            
+            digits = ''.join(filter(str.isdigit, text))
+            subs = int(digits) if digits else 0
             if name:
-                rows_to_write.append([now_ts, now_str, cid, name, subs, avatar])
+                rows_to_write.append([now_ts, now_str, name, name, subs, avatar])
+
 except Exception as e:
-    print(f"API attempt note: {e}")
+    print(f"Scraping error: {e}")
+finally:
+    driver.quit()
 
-# Try 2: HTML fallback parsing if API didn't return data
-if not rows_to_write:
-    try:
-        response = requests.get(URL, headers=headers, timeout=15)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-
-            # Search for embedded JSON data inside <script> tags
-            for script in soup.find_all('script'):
-                if script.string and ('subs' in script.string or 'channels' in script.string):
-                    json_matches = re.findall(r'(\[.*?\]|\{.*?\})', script.string)
-                    for match in json_matches:
-                        try:
-                            parsed = json.loads(match)
-                            if isinstance(parsed, list):
-                                for item in parsed:
-                                    if isinstance(item, dict) and ('name' in item or 'subs' in item):
-                                        name = item.get('name', '')
-                                        subs = item.get('subs', item.get('subscribers', 0))
-                                        avatar = item.get('avatar', item.get('image', ''))
-                                        cid = item.get('id', name)
-                                        if name:
-                                            rows_to_write.append([now_ts, now_str, cid, name, subs, avatar])
-                        except Exception:
-                            continue
-
-            # Fallback DOM element loop
-            if not rows_to_write:
-                elements = soup.find_all(True)
-                for el in elements:
-                    text = el.get_text(strip=True)
-                    img_el = el.find('img')
-                    if img_el and any(char.isdigit() for char in text):
-                        name = img_el.get('alt', '').strip()
-                        avatar = img_el.get('src', '')
-                        digits = ''.join(filter(str.isdigit, text))
-                        if name and digits:
-                            rows_to_write.append([now_ts, now_str, name, name, int(digits), avatar])
-
-    except Exception as e:
-        print(f"HTML parsing error: {e}")
-
-# Write results
+# Write extracted data to CSV
 if rows_to_write:
     with open(CSV_FILE_PATH, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerows(rows_to_write)
     print(f"Successfully recorded {len(rows_to_write)} channels.")
 else:
-    print("No channel data extracted this run.")
+    print("No channels found on page render.")
